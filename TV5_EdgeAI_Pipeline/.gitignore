@@ -1,0 +1,10 @@
+__pycache__/
+.venv/
+venv/
+models/*.onnx
+whitelist/*.json
+data/*
+results/*
+!data/.gitkeep
+!results/.gitkeep
+!whitelist/.gitkeep
