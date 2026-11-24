@@ -1,0 +1,48 @@
+{
+  "network": {
+    "edge_ip": "10.0.1.10",
+    "router_edge_ip": "10.0.1.1",
+    "router_server_ip": "10.0.2.1",
+    "storage_ip": "10.0.2.10",
+    "blockchain_ip": "10.0.2.20",
+    "tcp_port": 5001,
+    "bandwidth_profiles_mbps": [
+      5,
+      20,
+      100
+    ],
+    "default_bandwidth_mbps": 20,
+    "delay_ms": 10,
+    "loss_percent": 0.0
+  },
+  "paths": {
+    "video_dir": "video",
+    "results_dir": "results"
+  },
+  "tools": {
+    "mininet": "mn",
+    "ffmpeg": "ffmpeg",
+    "ffprobe": "ffprobe",
+    "iperf3": "iperf3",
+    "tc": "tc",
+    "tcpdump": "tcpdump"
+  },
+  "video_analysis": {
+    "extensions": [
+      ".mp4"
+    ],
+    "recursive": false
+  },
+  "storage_scenario": {
+    "assumed_bitrate_mbps": 4.0,
+    "events_per_day": 50,
+    "seconds_per_event": 10.0,
+    "ida_total_shards": 6,
+    "ida_data_shards": 4,
+    "days": [
+      1,
+      7,
+      30
+    ]
+  }
+}

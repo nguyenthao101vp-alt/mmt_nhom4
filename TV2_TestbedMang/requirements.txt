@@ -1,0 +1,2 @@
+# No third-party Python packages required for stage 0.
+# Mininet, FFmpeg, iperf3, iproute2 (tc), and tcpdump are installed via apt.
