@@ -1,41 +1,18 @@
-"""
-================================================================================
-THƯ VIỆN MẬT MÃ PYTHON - MỤC 1.3 & MODULE 2.3.2 (BẢO MẬT DỮ LIỆU CLIP)
-================================================================================
-Bao gồm đầy đủ các module chuẩn hóa cho TV4, TV5 (IPFS/Contract) và TV6 (Truy xuất):
-1. AES-256-GCM: Mã hóa và xác thực dữ liệu clip (Confidentiality & Integrity Tag).
-2. Rabin's IDA (Information Dispersal Algorithm) trên trường hữu hạn GF(2^8):
-   - Chia thành n mảnh, đủ t mảnh để khôi phục.
-   - Hỗ trợ cả tham số bài báo (n=6, t=4 -> giãn nở 1.5x, chịu mất 2 mảnh)
-     và tham số tối ưu demo nhóm (n=4, t=3 -> giãn nở 1.33x, chịu mất 1 mảnh).
-   - Lưu 8-byte header độ dài gốc để bảo toàn 100% file nhị phân (MP4/AES ciphertext).
-3. Pedersen DKG & Feldman VSS:
-   - Sinh khóa chung không cần bên tin cậy qua 2 vòng giao thức thực sự (không hardcode).
-   - Hỗ trợ tham số bài báo (n=5, t=3) và tham số demo nhóm (n=3, t=2).
-4. Threshold ElGamal + HKDF-SHA256 + KEM-DEM (Mục 2.2.4, Phương trình 19–22):
-   - Phía KEM: Bọc khóa đối xứng K bằng ElGamal ngưỡng (tính toán đúng modulo q).
-   - Phía KDF: Dẫn xuất khóa bọc KEK qua HKDF-SHA256.
-   - Phía DEM: Mã hóa khóa K bằng AES-256-GCM.
-5. Ví dụ số nhỏ (Small Number Examples) & Kiểm thử luồng End-to-End.
-================================================================================
-"""
-
+import hashlib
+import os
 import secrets
-from typing import List, Tuple, Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional, Tuple
 
-try:
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
-    from cryptography.hazmat.primitives import hashes
-except ImportError:
-    raise ImportError("Vui lòng cài đặt thư viện cryptography: pip install cryptography")
-
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 # ==============================================================================
-# CẤU HÌNH THAM SỐ NHÓM CYCLIC (RFC 3526 2048-BIT & THAM SỐ SỐ NHỎ)
+# 1. THAM SỐ HỆ THỐNG (NHÓM CYCLIC BẬC NGUYÊN TỐ q, SAFE PRIME p = 2q + 1)
 # ==============================================================================
-
-RFC3526_2048_P = int(
+# RFC 3526 - 2048-bit MODP Group (Group 14)
+RFC3526_P_HEX = (
     "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD1"
     "29024E088A67CC74020BBEA63B139B22514A08798E3404DD"
     "EF9519B3CD3A431B302B0A6DF25F14374FE1356D6D51C245"
@@ -46,441 +23,557 @@ RFC3526_2048_P = int(
     "670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
     "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9"
     "DE2BCBF6955817183995497CEA956AE515D2261898FA0510"
-    "15728E5A8AACAA68FFFFFFFFFFFFFFFF", 16
+    "15728E5A8AACAA68FFFFFFFFFFFFFFFF"
 )
-RFC3526_2048_Q = (RFC3526_2048_P - 1) // 2
-RFC3526_2048_G = 4  # Phần tử sinh của nhóm con bậc nguyên tố q (4 = 2^2 mod p)
-RFC3526_2048_H = pow(3, 2, RFC3526_2048_P)  # Phần tử sinh độc lập thứ hai cho cam kết Pedersen
 
-# Bộ tham số số nhỏ (p = 47, q = 23) dùng cho ví dụ minh họa tay trong Mục 1.3
-SMALL_P = 47
-SMALL_Q = 23
-SMALL_G = 4   # 4^23 mod 47 = 1
-SMALL_H = 9   # 9^23 mod 47 = 1
+
+@dataclass(frozen=True)
+class PublicParams:
+    """Tham số công khai pp = (p, q, g) từ VSS.Setup(1^k) [Mục 2.2.2]."""
+    p: int
+    q: int
+    g: int  # Phần tử sinh nhóm con G bậc q trong Z_p^*
+
+    @classmethod
+    def default_2048bit(cls) -> "PublicParams":
+        p = int(RFC3526_P_HEX, 16)
+        q = (p - 1) // 2
+        g = 4  # 2^2 mod p luôn sinh nhóm con thặng dư bậc hai bậc q
+        return cls(p=p, q=q, g=g)
+
+    @classmethod
+    def small_demo(cls) -> "PublicParams":
+        """Tham số số nhỏ p=47, q=23, g=4 dùng để kiểm chứng ví dụ tính tay."""
+        return cls(p=47, q=23, g=4)
 
 
 # ==============================================================================
-# 1. AES-256-GCM (MÃ HÓA VÀ XÁC THỰC DỮ LIỆU CLIP)
+# 2. MÃ HÓA ĐỐI XỨNG XÁC THỰC (AES-256-GCM)
 # ==============================================================================
-
 class SymmetricCipher:
-    """Xử lý sinh khóa 256-bit và mã hóa/giải mã xác thực AES-256-GCM."""
+    """Mã hóa và xác thực toàn vẹn dữ liệu video gốc bằng AES-256-GCM."""
 
     @staticmethod
     def generate_key() -> bytes:
-        """Sinh khóa đối xứng 256-bit (32 bytes) chuẩn CSPRNG (Mục 5.1 [FT])."""
-        return secrets.token_bytes(32)
+        return secrets.token_bytes(32)  # 256-bit key
 
     @staticmethod
-    def encrypt(plaintext: bytes, key: bytes, aad: bytes = b"") -> Dict[str, bytes]:
-        """Mã hóa và sinh thẻ xác thực GCM (16 bytes)."""
+    def encrypt(plaintext: bytes, key: bytes, aad: Optional[bytes] = None) -> Tuple[bytes, bytes, bytes]:
+        """Trả về (ciphertext, iv_nonce_12B, auth_tag_16B)."""
         if len(key) != 32:
-            raise ValueError("Khóa AES-256 phải có độ dài đúng 32 bytes.")
-        nonce = secrets.token_bytes(12)  # 96-bit IV chuẩn cho GCM
+            raise ValueError("Khóa AES-256-GCM phải dài đúng 32 bytes (256 bit).")
+        nonce = secrets.token_bytes(12)
         aesgcm = AESGCM(key)
         ct_with_tag = aesgcm.encrypt(nonce, plaintext, aad)
-        return {
-            "ciphertext": ct_with_tag[:-16],
-            "nonce": nonce,
-            "tag": ct_with_tag[-16:],
-        }
+        return ct_with_tag[:-16], nonce, ct_with_tag[-16:]
 
     @staticmethod
-    def decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes, aad: bytes = b"") -> bytes:
-        """Giải mã và xác thực tính toàn vẹn dữ liệu."""
-        if len(key) != 32:
-            raise ValueError("Khóa AES-256 phải có độ dài đúng 32 bytes.")
+    def decrypt(ciphertext: bytes, key: bytes, nonce: bytes, tag: bytes, aad: Optional[bytes] = None) -> bytes:
+        """Giải mã và kiểm tra thẻ xác thực GCM. Ném InvalidTag nếu dữ liệu bị sửa đổi."""
         aesgcm = AESGCM(key)
         return aesgcm.decrypt(nonce, ciphertext + tag, aad)
 
 
 # ==============================================================================
-# 2. IDA CỦA RABIN TRÊN TRƯỜNG HỮU HẠN GF(2^8)
+# 3. THUẬT TOÁN PHÂN TÁN THÔNG TIN RABIN IDA TRÊN TRƯỜNG GF(2^8)
 # ==============================================================================
+class GF256:
+    """Số học trường hữu hạn GF(2^8) với đa thức bất khả quy AES: x^8 + x^4 + x^3 + x + 1 (0x11B)."""
+    EXP = [0] * 512
+    LOG = [0] * 256
+
+    @classmethod
+    def _init_tables(cls):
+        if cls.EXP[0] != 0:
+            return
+        x = 1
+        for i in range(255):
+            cls.EXP[i] = x
+            cls.LOG[x] = i
+            # Nhân x với phần tử sinh 0x03 trong GF(2^8)
+            x_times_2 = ((x << 1) ^ 0x1B) & 0xFF if (x & 0x80) else (x << 1)
+            x = x_times_2 ^ x
+        for i in range(255, 512):
+            cls.EXP[i] = cls.EXP[i - 255]
+
+    @classmethod
+    def mul(cls, a: int, b: int) -> int:
+        if a == 0 or b == 0:
+            return 0
+        return cls.EXP[cls.LOG[a] + cls.LOG[b]]
+
+    @classmethod
+    def inv(cls, a: int) -> int:
+        if a == 0:
+            raise ZeroDivisionError("Không tồn tại nghịch đảo của 0 trong GF(2^8).")
+        return cls.EXP[255 - cls.LOG[a]]
+
+
+GF256._init_tables()
+
 
 class RabinIDA:
     """
-    Phân tán dữ liệu chuẩn Rabin IDA trên GF(2^8) (đa thức bất khả quy 0x11B):
-    - Gom mỗi khối đúng t byte (đa thức bậc t-1) -> hệ số giãn nở chính xác n/t
-      (với n=6, t=4 dung lượng tăng đúng 1.5x và chịu mất tối đa 2 mảnh).
-    - Gắn 8-byte header độ dài gốc giúp khôi phục chính xác file nhị phân có byte 0x00 ở cuối.
+    Rabin's Information Dispersal Algorithm [Mục 2.1.1, Eqs. (1)-(2)].
+    Phân tán dữ liệu D thành n mảnh P_i, khôi phục từ bất kỳ t mảnh nào.
     """
-
-    _GF_EXP = [0] * 512
-    _GF_LOG = [0] * 256
-    _INITIALIZED = False
-
-    @classmethod
-    def _init_gf256(cls) -> None:
-        if cls._INITIALIZED:
-            return
-        # Phần tử sinh nguyên thủy 0x03 trên GF(2^8) modulo x^8 + x^4 + x^3 + x + 1 (0x11B)
-        x = 1
-        for i in range(255):
-            cls._GF_EXP[i] = x
-            cls._GF_LOG[x] = i
-            x_times_2 = (x << 1) ^ (0x11B if (x & 0x80) else 0)
-            x = x_times_2 ^ x
-        for i in range(255, 512):
-            cls._GF_EXP[i] = cls._GF_EXP[i - 255]
-        cls._INITIALIZED = True
-
-    @classmethod
-    def _gf_mul(cls, a: int, b: int) -> int:
-        if a == 0 or b == 0:
-            return 0
-        return cls._GF_EXP[cls._GF_LOG[a] + cls._GF_LOG[b]]
-
-    @classmethod
-    def _gf_inv(cls, a: int) -> int:
-        if a == 0:
-            raise ZeroDivisionError("Không tồn tại nghịch đảo của 0 trong GF(2^8).")
-        if a == 1:
-            return 1
-        return cls._GF_EXP[255 - cls._GF_LOG[a]]
 
     def __init__(self, n: int = 6, t: int = 4):
         if not (1 <= t <= n <= 255):
-            raise ValueError("Yêu cầu 1 <= t <= n <= 255.")
-        self._init_gf256()
+            raise ValueError("Tham số IDA phải thỏa mãn 1 <= t <= n <= 255.")
         self.n = n
         self.t = t
-        self.matrix = self._build_vandermonde_matrix(n, t)
+        # Ma trận phân tán Cauchy E kích thước n x t trên GF(2^8) (mọi ma trận con t x t đều khả nghịch)
+        self.encoding_matrix = self._build_cauchy_matrix(n, t)
 
-    @classmethod
-    def _build_vandermonde_matrix(cls, n: int, t: int) -> List[List[int]]:
-        """Tạo ma trận phân tán Vandermonde n x t trên GF(2^8) đảm bảo mọi ma trận con t x t khả nghịch."""
+    @staticmethod
+    def _build_cauchy_matrix(n: int, t: int) -> List[List[int]]:
+        # Chọn tập X = {0..n-1} và Y = {n..n+t-1} đôi một phân biệt trong GF(2^8)
         matrix = []
-        for i in range(1, n + 1):
+        for i in range(n):
             row = []
-            val = 1
-            for _ in range(t):
-                row.append(val)
-                val = cls._gf_mul(val, i)
+            for j in range(t):
+                x_i = i
+                y_j = n + j
+                row.append(GF256.inv(x_i ^ y_j))
             matrix.append(row)
         return matrix
 
-    @classmethod
-    def _invert_matrix(cls, mat: List[List[int]]) -> List[List[int]]:
-        """Nghịch đảo ma trận vuông t x t trên GF(2^8) bằng phương pháp khử Gauss-Jordan."""
+    def disperse(self, data: bytes) -> List[Tuple[int, bytes]]:
+        """
+        IDA.disperse(D, n, t) -> [(index_i, piece_P_i), ...] [Eq. (1)].
+        Gắn 8 byte header lưu độ dài gốc để khôi phục chính xác file nhị phân.
+        """
+        payload = len(data).to_bytes(8, "big") + data
+        pad_len = (-len(payload)) % self.t
+        payload += b"\x00" * pad_len
+        cols = len(payload) // self.t
+
+        # Sắp xếp dữ liệu thành ma trận M kích thước t x cols
+        M = [payload[r * cols : (r + 1) * cols] for r in range(self.t)]
+
+        pieces = []
+        for i in range(self.n):
+            row_E = self.encoding_matrix[i]
+            piece_bytes = bytearray(cols)
+            for c in range(cols):
+                acc = 0
+                for r in range(self.t):
+                    acc ^= GF256.mul(row_E[r], M[r][c])
+                piece_bytes[c] = acc
+            pieces.append((i + 1, bytes(piece_bytes)))
+        return pieces
+
+    def reconstruct(self, pieces: List[Tuple[int, bytes]]) -> bytes:
+        """
+        IDA.reconstruct({P_i}_{i in T}) -> D [Eq. (2)].
+        Dùng khử Gauss-Jordan tìm nghịch đảo ma trận con E' kích thước t x t.
+        """
+        if len(pieces) < self.t:
+            raise ValueError(f"Cần tối thiểu {self.t} mảnh để khôi phục, hiện chỉ có {len(pieces)}.")
+
+        selected = pieces[: self.t]
+        indices = [idx - 1 for idx, _ in selected]
+        piece_data = [p for _, p in selected]
+        cols = len(piece_data[0])
+
+        # Trích xuất ma trận con E' (t x t) và tính nghịch đảo trên GF(2^8)
+        sub_E = [list(self.encoding_matrix[idx]) for idx in indices]
+        inv_E = self._invert_matrix_gf256(sub_E)
+
+        # M = (E')^{-1} * [P_{i1}, ..., P_{it}]^T
+        reconstructed_rows = []
+        for r in range(self.t):
+            row_bytes = bytearray(cols)
+            for c in range(cols):
+                acc = 0
+                for k in range(self.t):
+                    acc ^= GF256.mul(inv_E[r][k], piece_data[k][c])
+                row_bytes[c] = acc
+            reconstructed_rows.append(bytes(row_bytes))
+
+        raw_padded = b"".join(reconstructed_rows)
+        orig_len = int.from_bytes(raw_padded[:8], "big")
+        return raw_padded[8 : 8 + orig_len]
+
+    @staticmethod
+    def _invert_matrix_gf256(mat: List[List[int]]) -> List[List[int]]:
         t = len(mat)
-        aug = [row[:] + [1 if i == j else 0 for j in range(t)] for i, row in enumerate(mat)]
+        aug = [mat[i] + [1 if i == j else 0 for j in range(t)] for i in range(t)]
 
         for col in range(t):
             pivot = next((r for r in range(col, t) if aug[r][col] != 0), None)
             if pivot is None:
-                raise ValueError("Ma trận con suy biến, không thể khôi phục dữ liệu.")
+                raise ValueError("Ma trận con suy biến, không thể nghịch đảo.")
             aug[col], aug[pivot] = aug[pivot], aug[col]
 
-            inv_pivot = cls._gf_inv(aug[col][col])
+            inv_pivot = GF256.inv(aug[col][col])
             for c in range(2 * t):
-                aug[col][c] = cls._gf_mul(aug[col][c], inv_pivot)
+                aug[col][c] = GF256.mul(aug[col][c], inv_pivot)
 
             for r in range(t):
                 if r != col and aug[r][col] != 0:
                     factor = aug[r][col]
                     for c in range(2 * t):
-                        aug[r][c] ^= cls._gf_mul(factor, aug[col][c])
+                        aug[r][c] ^= GF256.mul(factor, aug[col][c])
 
         return [row[t:] for row in aug]
 
-    def distribute(self, data: bytes) -> List[Tuple[int, bytes]]:
-        """Chia dữ liệu thành n mảnh (index_1_based, share_bytes)."""
-        orig_len = len(data)
-        payload = orig_len.to_bytes(8, "big") + data
-        pad_len = (self.t - (len(payload) % self.t)) % self.t
-        payload += b"\x00" * pad_len
-
-        num_cols = len(payload) // self.t
-        shares: List[Tuple[int, bytes]] = []
-
-        for row_idx in range(self.n):
-            m_row = self.matrix[row_idx]
-            mul_tables = [[self._gf_mul(m_row[r], b) for b in range(256)] for r in range(self.t)]
-            share_buf = bytearray(num_cols)
-            for c in range(num_cols):
-                acc = 0
-                for r in range(self.t):
-                    acc ^= mul_tables[r][payload[r * num_cols + c]]
-                share_buf[c] = acc
-            shares.append((row_idx + 1, bytes(share_buf)))
-
-        return shares
-
-    def reconstruct(self, active_shares: List[Tuple[int, bytes]]) -> bytes:
-        """Khôi phục nguyên vẹn dữ liệu gốc từ tối thiểu t mảnh bất kỳ."""
-        if len(active_shares) < self.t:
-            raise ValueError(f"Cần ít nhất {self.t} mảnh để khôi phục, hiện có {len(active_shares)}.")
-
-        selected = active_shares[: self.t]
-        sub_matrix = [self.matrix[idx - 1] for idx, _ in selected]
-        inv_matrix = self._invert_matrix(sub_matrix)
-
-        num_cols = len(selected[0][1])
-        reconstructed = bytearray(num_cols * self.t)
-
-        inv_tables = [
-            [[self._gf_mul(inv_matrix[r][k], b) for b in range(256)] for k in range(self.t)]
-            for r in range(self.t)
-        ]
-
-        for c in range(num_cols):
-            for r in range(self.t):
-                acc = 0
-                for k in range(self.t):
-                    acc ^= inv_tables[r][k][selected[k][1][c]]
-                reconstructed[r * num_cols + c] = acc
-
-        orig_len = int.from_bytes(reconstructed[:8], "big")
-        return bytes(reconstructed[8 : 8 + orig_len])
-
 
 # ==============================================================================
-# 3. PEDERSEN DKG & FELDMAN VSS (SINH KHÓA PHÂN TÁN KHÔNG BÊN TIN CẬY)
+# 4. FELDMAN VSS & PEDERSEN DKG 
 # ==============================================================================
+class FeldmanVSS:
+    """Chia sẻ bí mật có thể kiểm chứng Feldman (VSS.Share, VSS.Verify, VSS.Reconstruct)."""
 
-def _eval_polynomial(coeffs: List[int], x: int, q: int) -> int:
-    """Tính giá trị đa thức f(x) = sum(a_k * x^k) mod q bằng lược đồ Horner."""
-    res = 0
-    for coeff in reversed(coeffs):
-        res = (res * x + coeff) % q
-    return res
+    @staticmethod
+    def share(secret: int, t: int, n: int, pp: PublicParams) -> Tuple[Dict[int, int], List[int]]:
+        """
+        Sinh đa thức f(x) bậc t-1 với a_0 = secret, trả về:
+        - shares: {j: f(j) mod q} cho j = 1..n
+        - commitments: [C_0, ..., C_{t-1}] với C_l = g^{a_l} mod p
+        """
+        coeffs = [secret % pp.q] + [secrets.randbelow(pp.q - 1) + 1 for _ in range(t - 1)]
+        commitments = [pow(pp.g, a_l, pp.p) for a_l in coeffs]
+
+        shares = {}
+        for j in range(1, n + 1):
+            val = 0
+            for power, coeff in enumerate(coeffs):
+                val = (val + coeff * pow(j, power, pp.q)) % pp.q
+            shares[j] = val
+        return shares, commitments
+
+    @staticmethod
+    def verify(index_j: int, share_val: int, commitments: List[int], pp: PublicParams) -> bool:
+        """Kiểm tra g^{s_j} == prod_{l=0}^{t-1} (C_l)^{j^l} mod p [Eq. (7) & Eq. (31)]."""
+        lhs = pow(pp.g, share_val, pp.p)
+        rhs = 1
+        for l, c_l in enumerate(commitments):
+            rhs = (rhs * pow(c_l, pow(index_j, l, pp.q), pp.p)) % pp.p
+        return lhs == rhs
 
 
-class DKGNode:
-    """Đại diện một nút đồng quản lý trong giao thức Pedersen DKG + Feldman VSS."""
+class ShareholderNode:
+    """
+    Đại diện một cổ đông SH_i trong giao thức Pedersen DKG và ElGamal ngưỡng [Mục 4.1].
+    """
 
-    def __init__(self, node_id: int, n: int, t: int, p: int, q: int, g: int, h: int):
-        self.id = node_id
-        self.n = n
-        self.t = t
-        self.p = p
-        self.q = q
-        self.g = g
-        self.h = h
+    def __init__(self, index: int, n_sh: int, t_sh: int, pp: PublicParams):
+        self.index = index  # i in {1..n_sh}
+        self.n_sh = n_sh
+        self.t_sh = t_sh
+        self.pp = pp
 
-        # Sinh 2 đa thức ngẫu nhiên bậc t-1 trên Z_q: f_i(x) và f'_i(x) (đa thức làm mù)
-        self.f_coeffs = [secrets.randbelow(q - 1) + 1 for _ in range(t)]
-        self.f_prime_coeffs = [secrets.randbelow(q - 1) + 1 for _ in range(t)]
-
-        # Cam kết Pedersen C_{i,k} = g^{a_{i,k}} * h^{b_{i,k}} mod p
-        self.pedersen_commitments = [
-            (pow(g, a, p) * pow(h, b, p)) % p
-            for a, b in zip(self.f_coeffs, self.f_prime_coeffs)
-        ]
-        # Cam kết Feldman A_{i,k} = g^{a_{i,k}} mod p để dựng khóa công khai chung Y
-        self.feldman_commitments = [pow(g, a, p) for a in self.f_coeffs]
-
-        self.received_shares: Dict[int, Tuple[int, int]] = {}
-        self.sk_share: int = 0
-
-    def create_share_for(self, target_id: int) -> Tuple[int, int]:
-        return (
-            _eval_polynomial(self.f_coeffs, target_id, self.q),
-            _eval_polynomial(self.f_prime_coeffs, target_id, self.q),
+        # Bí mật đóng góp cục bộ s_i và đa thức f_i(x)
+        self._secret_contrib = secrets.randbelow(pp.q - 1) + 1
+        self.sent_shares, self.commitments = FeldmanVSS.share(
+            self._secret_contrib, t_sh, n_sh, pp
         )
 
-    def verify_and_accept_share(
-        self, sender_id: int, share: Tuple[int, int], pedersen_comms: List[int]
-    ) -> bool:
-        """Kiểm chứng mảnh chia sẻ nhận được bằng cam kết Pedersen VSS."""
-        s_ij, s_prime_ij = share
-        lhs = (pow(self.g, s_ij, self.p) * pow(self.h, s_prime_ij, self.p)) % self.p
+        self.sk_share: Optional[int] = None  # Mảnh khóa bí mật tổng hợp sk_j
+        self.vk: Optional[int] = None        # Khóa xác minh công khai vk_j = g^{sk_j} mod p
+        self.master_pk: Optional[int] = None # Khóa công khai chung PK
 
-        rhs = 1
-        x_pow = 1
-        for c_k in pedersen_comms:
-            rhs = (rhs * pow(c_k, x_pow, self.p)) % self.p
-            x_pow = (x_pow * self.id) % self.q
-
-        if lhs != rhs:
-            return False
-        self.received_shares[sender_id] = share
-        return True
-
-    def compute_final_secret_share(self) -> int:
-        """Tổng hợp khóa bí mật thành phần x_j = sum_i s_{i,j} mod q."""
-        self.sk_share = sum(s[0] for s in self.received_shares.values()) % self.q
-        return self.sk_share
-
-
-# ==============================================================================
-# 4. THRESHOLD ELGAMAL, HKDF-SHA256 & KEM-DEM (MỤC 2.2.4, PT 19–22)
-# ==============================================================================
-
-class ThresholdCryptoSystem:
-    """
-    Hệ mật ngưỡng hoàn chỉnh kết nối Pedersen DKG -> Threshold ElGamal -> HKDF -> AES-256-GCM:
-    - Mọi phép toán số mũ và nội suy Lagrange thực hiện chính xác trên trường Z_q.
-    - KEM bọc khóa đối xứng K của clip bằng khóa công khai chung Y của nhóm đồng quản lý.
-    """
-
-    def __init__(
+    def finalize_dkg(
         self,
-        n: int = 5,
-        t: int = 3,
-        p: int = RFC3526_2048_P,
-        q: int = RFC3526_2048_Q,
-        g: int = RFC3526_2048_G,
-        h: int = RFC3526_2048_H,
-    ):
-        self.n = n
-        self.t = t
-        self.p = p
-        self.q = q
-        self.g = g
-        self.h = h
+        received_shares: Dict[int, int],
+        all_commitments: Dict[int, List[int]],
+    ) -> Tuple[int, int]:
+        """
+        Kiểm chứng chéo mọi mảnh s_{i,j} từ SH_i, tổng hợp sk_j, vk_j và PK [Eqs. (14)-(16)].
+        """
+        for sender_idx, s_ij in received_shares.items():
+            if not FeldmanVSS.verify(self.index, s_ij, all_commitments[sender_idx], self.pp):
+                raise ValueError(f"SH_{self.index} phát hiện mảnh gian lận từ SH_{sender_idx}!")
 
-    def generate_dkg_keys(self) -> Tuple[int, Dict[int, int]]:
-        """Chạy giao thức DKG Pedersen 2 vòng giữa n nút, trả về (PK_chung, {node_id: sk_i})."""
-        nodes = [DKGNode(i, self.n, self.t, self.p, self.q, self.g, self.h) for i in range(1, self.n + 1)]
+        self.sk_share = sum(received_shares.values()) % self.pp.q
+        self.vk = pow(self.pp.g, self.sk_share, self.pp.p)
 
-        # Vòng 1: Phát tán mảnh và kiểm chứng VSS
-        for sender in nodes:
-            for receiver in nodes:
-                share = sender.create_share_for(receiver.id)
-                if not receiver.verify_and_accept_share(sender.id, share, sender.pedersen_commitments):
-                    raise RuntimeError(f"Kiểm chứng VSS thất bại từ nút {sender.id} tới nút {receiver.id}.")
+        pk = 1
+        for sender_idx in range(1, self.n_sh + 1):
+            pk = (pk * all_commitments[sender_idx][0]) % self.pp.p
+        self.master_pk = pk
+        return self.vk, self.master_pk
 
-        # Vòng 2: Tổng hợp khóa bí mật thành phần và khóa công khai chung Y
-        secret_shares = {node.id: node.compute_final_secret_share() for node in nodes}
-        joint_public_key = 1
-        for node in nodes:
-            joint_public_key = (joint_public_key * node.feldman_commitments[0]) % self.p
+    def partial_decrypt(self, c1: int) -> Tuple[int, Tuple[int, int]]:
+        """
+        TElG.partdec(sk_i, (c1, c2)) -> (delta_i, pi_i) [Eqs. (23)-(24)].
+        Tính mảnh giải mã từng phần delta_i = c1^{sk_i} mod p kèm bằng chứng ZKP Chaum-Pedersen.
+        """
+        if self.sk_share is None or self.vk is None:
+            raise RuntimeError("Node chưa hoàn tất DKG.")
+        delta_i = pow(c1, self.sk_share, self.pp.p)
 
-        return joint_public_key, secret_shares
+        # Bằng chứng Chaum-Pedersen chứng minh log_g(vk_i) == log_{c1}(delta_i)
+        w = secrets.randbelow(self.pp.q - 1) + 1
+        A = pow(self.pp.g, w, self.pp.p)
+        B = pow(c1, w, self.pp.p)
+        e = self._chaum_pedersen_challenge(c1, self.vk, delta_i, A, B)
+        z = (w + e * self.sk_share) % self.pp.q
+        return delta_i, (e, z)
 
-    def _derive_kek(self, shared_secret_z: int, info: bytes = b"FileTrust-KEM-DEM-v1") -> bytes:
-        """KDF: Dẫn xuất khóa bọc KEK 256-bit từ bí mật chung Z = g^{r*x} mod p bằng HKDF-SHA256."""
-        byte_len = (self.p.bit_length() + 7) // 8
-        ikm = shared_secret_z.to_bytes(byte_len, "big")
-        return HKDF(
+    def _chaum_pedersen_challenge(self, c1: int, vk_i: int, delta_i: int, A: int, B: int) -> int:
+        h = hashlib.sha256()
+        for val in (self.pp.g, c1, vk_i, delta_i, A, B):
+            h.update(val.to_bytes((val.bit_length() + 7) // 8 or 1, "big"))
+        return int.from_bytes(h.digest(), "big") % self.pp.q
+
+
+def run_dkg_ceremony(n_sh: int, t_sh: int, pp: PublicParams) -> Tuple[List[ShareholderNode], int]:
+    """Điều phối chạy thử nghi thức Pedersen DKG cho n_sh cổ đông."""
+    nodes = [ShareholderNode(i, n_sh, t_sh, pp) for i in range(1, n_sh + 1)]
+    all_commitments = {node.index: node.commitments for node in nodes}
+
+    master_pk = 0
+    for receiver in nodes:
+        inbox = {sender.index: sender.sent_shares[receiver.index] for sender in nodes}
+        _, pk = receiver.finalize_dkg(inbox, all_commitments)
+        master_pk = pk
+    return nodes, master_pk
+
+
+# ==============================================================================
+# 5. ELGAMAL NGƯỠNG (TElG) & LAI GHÉP KEM-DEM + HKDF-SHA256 [Mục 2.2.4, Eqs. (18)-(27)]
+# ==============================================================================
+class ThresholdElGamalKEMDEM:
+    """
+    Thực thi ElGamal ngưỡng (TElG) kết hợp KDF (HKDF-SHA256) và DEM:
+    - Hỗ trợ đầy đủ phương trình (19)-(22) bảo vệ CID theo FileTrust.
+    - Hỗ trợ phương trình (18)-(27) đóng gói khóa phiên K (256-bit) của video clip.
+    """
+
+    def __init__(self, pp: PublicParams):
+        self.pp = pp
+
+    def _encode_to_subgroup(self, key_bytes: bytes) -> int:
+        """
+        Ánh xạ khóa 256-bit (hoặc số nguyên < q) vào nhóm con G bậc q trong Z_p^*.
+        Vì p = 2q + 1 là safe prime, với m_raw in [1, q-1], m_bar = (m_raw^2) mod p luôn thuộc G.
+        """
+        m_raw = (int.from_bytes(key_bytes, "big") % (self.pp.q - 2)) + 2
+        return pow(m_raw, 2, self.pp.p), m_raw
+
+    def _decode_from_subgroup(self, m_bar: int) -> int:
+        """Lấy căn bậc hai chính tắc trong [2, q-1] khi p % 4 == 3."""
+        # Với RFC 3526 p và p=47, p % 4 == 3 nên căn bậc hai modulo p là m_bar^{(p+1)/4} mod p
+        root = pow(m_bar, (self.pp.p + 1) // 4, self.pp.p)
+        return root if root <= self.pp.q else (self.pp.p - root)
+
+    def _lagrange_coeff(self, i: int, subset_T: List[int]) -> int:
+        """Tính hệ số nội suy Lagrange lambda_{i,T} tại x = 0 trên Z_q [Eq. (10)]."""
+        num = 1
+        den = 1
+        for j in subset_T:
+            if j != i:
+                num = (num * j) % self.pp.q
+                den = (den * (j - i)) % self.pp.q
+        return (num * pow(den, -1, self.pp.q)) % self.pp.q
+
+    def verify_partial_proof(self, c1: int, vk_i: int, delta_i: int, proof: Tuple[int, int]) -> bool:
+        """Kiểm tra bằng chứng Chaum-Pedersen pi_i = (e, z) [Eq. (25)]."""
+        e, z = proof
+        inv_vk_e = pow(pow(vk_i, e, self.pp.p), -1, self.pp.p)
+        inv_delta_e = pow(pow(delta_i, e, self.pp.p), -1, self.pp.p)
+
+        A_check = (pow(self.pp.g, z, self.pp.p) * inv_vk_e) % self.pp.p
+        B_check = (pow(c1, z, self.pp.p) * inv_delta_e) % self.pp.p
+
+        h = hashlib.sha256()
+        for val in (self.pp.g, c1, vk_i, delta_i, A_check, B_check):
+            h.update(val.to_bytes((val.bit_length() + 7) // 8 or 1, "big"))
+        e_check = int.from_bytes(h.digest(), "big") % self.pp.q
+        return e == e_check
+
+    # --- 5A. Đóng gói & Mở gói phần tử nhóm qua TElG [Eqs. (18), (26), (27)] ---
+    def telg_encrypt(self, m_bar: int, master_pk: int) -> Tuple[int, int]:
+        """TElG.enc(m_bar, PK) -> (c1, c2) [Eq. (18)]."""
+        r = secrets.randbelow(self.pp.q - 1) + 1
+        c1 = pow(self.pp.g, r, self.pp.p)
+        c2 = (m_bar * pow(master_pk, r, self.pp.p)) % self.pp.p
+        return c1, c2
+
+    def telg_combine(
+        self,
+        c1: int,
+        c2: int,
+        partials: Dict[int, Tuple[int, Tuple[int, int]]],
+        vks: Dict[int, int],
+    ) -> int:
+        """TElG.comb({(delta_i, pi_i)}_{i in T}, (c1, c2)) -> m_bar [Eqs. (26)-(27)]."""
+        subset_T = list(partials.keys())
+        delta = 1
+        for i in subset_T:
+            delta_i, pi_i = partials[i]
+            if not self.verify_partial_proof(c1, vks[i], delta_i, pi_i):
+                raise ValueError(f"Bằng chứng ZKP giải mã từng phần của SH_{i} không hợp lệ!")
+            lam = self._lagrange_coeff(i, subset_T)
+            delta = (delta * pow(delta_i, lam, self.pp.p)) % self.pp.p
+
+        m_bar = (c2 * pow(delta, -1, self.pp.p)) % self.pp.p
+        return m_bar
+
+    # --- 5B. Cơ chế bảo vệ CID theo FileTrust [Eqs. (19)-(22)] ---
+    @staticmethod
+    def derive_kdf_stream(k_bytes: bytes, context: bytes, length: int) -> bytes:
+        """S_i = KDF(K_i, ctx_i, |CID_i|) dùng HKDF-SHA256 [Eq. (20)]."""
+        hkdf = HKDF(
             algorithm=hashes.SHA256(),
-            length=32,
+            length=length,
             salt=None,
-            info=info,
-        ).derive(ikm)
+            info=context,
+        )
+        return hkdf.derive(k_bytes)
 
-    def kem_dem_encapsulate_key(self, joint_public_key: int, clip_aes_key: bytes) -> Dict[str, object]:
+    def protect_cid_filetrust(
+        self, cid_str: str, context: bytes, master_pk: int
+    ) -> Dict[str, object]:
         """
-        Đóng gói khóa đối xứng K của clip bằng KEM-DEM (Phương trình 19–22 [FT]):
-        - Phía KEM: Sinh r ngẫu nhiên trong Z_q*, tính C1 = g^r mod p, Z = Y^r mod p -> KEK = HKDF(Z).
-        - Phía DEM: Dùng KEK mã hóa AES-256-GCM khóa K tạo C_DEM.
+        Thực thi trọn vẹn Phương trình (19)-(22) bảo vệ một CID:
+        1. K_i <- {0,1}^256
+        2. S_i = HKDF-SHA256(K_i, ctx_i, |CID_i|)
+        3. ctSym_i = S_i XOR CID_i
+        4. (c1, c2) = TElG.enc(encode(K_i), PK)
         """
-        r = secrets.randbelow(self.q - 1) + 1
-        c1 = pow(self.g, r, self.p)
-        shared_z = pow(joint_public_key, r, self.p)
+        cid_bytes = cid_str.encode("utf-8")
+        k_i = secrets.token_bytes(32)  # Eq. (19)
+        s_i = self.derive_kdf_stream(k_i, context, len(cid_bytes))  # Eq. (20)
+        ct_sym = bytes(a ^ b for a, b in zip(s_i, cid_bytes))  # Eq. (21)
 
-        kek = self._derive_kek(shared_z)
-        byte_len = (self.p.bit_length() + 7) // 8
-        dem_pkg = SymmetricCipher.encrypt(clip_aes_key, kek, aad=c1.to_bytes(byte_len, "big"))
+        # Ánh xạ K_i (256-bit < q của nhóm 2048-bit) vào G để đóng gói TElG [Eq. (22)]
+        k_int = int.from_bytes(k_i, "big")
+        k_bar = pow(k_int, 2, self.pp.p)
+        c1, c2 = self.telg_encrypt(k_bar, master_pk)
+
+        return {"c1": c1, "c2": c2, "ctSym": ct_sym}
+
+    def recover_cid_filetrust(
+        self,
+        protected_tuple: Dict[str, object],
+        context: bytes,
+        partials: Dict[int, Tuple[int, Tuple[int, int]]],
+        vks: Dict[int, int],
+    ) -> str:
+        """Khôi phục CID gốc từ (c1, c2, ctSym) sau khi thu thập đủ t_SH mảnh giải mã."""
+        c1 = int(protected_tuple["c1"])
+        c2 = int(protected_tuple["c2"])
+        ct_sym = bytes(protected_tuple["ctSym"])
+
+        k_bar = self.telg_combine(c1, c2, partials, vks)
+        k_int = self._decode_from_subgroup(k_bar)
+        k_i = k_int.to_bytes(32, "big")
+
+        s_i = self.derive_kdf_stream(k_i, context, len(ct_sym))
+        cid_bytes = bytes(a ^ b for a, b in zip(ct_sym, s_i))
+        return cid_bytes.decode("utf-8")
+
+    # --- 5C. Cơ chế tối ưu của nhóm: Đóng gói duy nhất khóa video K qua KEM-DEM ---
+    def encapsulate_clip_key(self, clip_key: bytes, master_pk: int, clip_id: str) -> Dict[str, object]:
+        """
+        Đóng gói khóa đối xứng K (32 bytes) của video bằng TElG + HKDF-SHA256 + AES-GCM:
+        - KEM: sinh khóa bọc ngẫu nhiên Z_seed, đóng gói bằng TElG -> (c1, c2)
+        - KDF: KEK = HKDF-SHA256(Z_seed, clip_id)
+        - DEM: mã hóa xác thực clip_key bằng KEK (AAD = c1) -> (c_dem, iv_kem, tag_kem)
+        """
+        z_seed = secrets.token_bytes(32)
+        z_int = int.from_bytes(z_seed, "big")
+        z_bar = pow(z_int, 2, self.pp.p)
+        c1, c2 = self.telg_encrypt(z_bar, master_pk)
+
+        kek = self.derive_kdf_stream(z_seed, f"KEM-KEK:{clip_id}".encode(), 32)
+        aad = c1.to_bytes((c1.bit_length() + 7) // 8, "big")
+        c_dem, iv_kem, tag_kem = SymmetricCipher.encrypt(clip_key, kek, aad=aad)
 
         return {
             "c1": c1,
-            "c_dem": dem_pkg["ciphertext"],
-            "nonce": dem_pkg["nonce"],
-            "tag": dem_pkg["tag"],
+            "c2": c2,
+            "c_dem": c_dem,
+            "iv_kem": iv_kem,
+            "tag_kem": tag_kem,
         }
 
-    def partial_decrypt(self, c1: int, node_id: int, sk_share: int) -> Tuple[int, int]:
-        """Mỗi nút đồng quản lý tính mảnh giải mã từng phần d_i = C1^{sk_i} mod p khi phê duyệt."""
-        return node_id, pow(c1, sk_share, self.p)
-
-    def _lagrange_coeff(self, i: int, active_ids: List[int]) -> int:
-        """Tính hệ số nội suy Lagrange lambda_i tại x = 0 trên trường Z_q (modulo q)."""
-        num, den = 1, 1
-        for j in active_ids:
-            if i != j:
-                num = (num * (-j)) % self.q
-                den = (den * (i - j)) % self.q
-        return (num * pow(den, -1, self.q)) % self.q
-
-    def kem_dem_decapsulate_key(
-        self, encapsulated_pkg: Dict[str, object], partial_shares: List[Tuple[int, int]]
+    def decapsulate_clip_key(
+        self,
+        kem_package: Dict[str, object],
+        clip_id: str,
+        partials: Dict[int, Tuple[int, Tuple[int, int]]],
+        vks: Dict[int, int],
     ) -> bytes:
-        """
-        Tái tạo khóa K từ t mảnh phê duyệt (Mục 2.4.3 - thời gian t_xh):
-        Z = prod_{i in S} (d_i)^{lambda_i} mod p -> KEK = HKDF(Z) -> giải mã DEM khôi phục khóa K.
-        """
-        if len(partial_shares) < self.t:
-            raise ValueError(f"Cần ít nhất {self.t} bên phê duyệt, hiện chỉ có {len(partial_shares)}.")
+        """Tái tạo khóa đối xứng K của video khi có đủ t_SH cổ đông phê duyệt."""
+        c1 = int(kem_package["c1"])
+        c2 = int(kem_package["c2"])
+        z_bar = self.telg_combine(c1, c2, partials, vks)
+        z_int = self._decode_from_subgroup(z_bar)
+        z_seed = z_int.to_bytes(32, "big")
 
-        selected = partial_shares[: self.t]
-        active_ids = [nid for nid, _ in selected]
-
-        shared_z = 1
-        for nid, d_i in selected:
-            lam = self._lagrange_coeff(nid, active_ids)
-            shared_z = (shared_z * pow(d_i, lam, self.p)) % self.p
-
-        kek = self._derive_kek(shared_z)
-        byte_len = (self.p.bit_length() + 7) // 8
+        kek = self.derive_kdf_stream(z_seed, f"KEM-KEK:{clip_id}".encode(), 32)
+        aad = c1.to_bytes((c1.bit_length() + 7) // 8, "big")
         return SymmetricCipher.decrypt(
-            ciphertext=encapsulated_pkg["c_dem"],
-            key=kek,
-            nonce=encapsulated_pkg["nonce"],
-            tag=encapsulated_pkg["tag"],
-            aad=encapsulated_pkg["c1"].to_bytes(byte_len, "big"),
+            bytes(kem_package["c_dem"]),
+            kek,
+            bytes(kem_package["iv_kem"]),
+            bytes(kem_package["tag_kem"]),
+            aad=aad,
         )
 
 
 # ==============================================================================
-# 5. VÍ DỤ SỐ NHỎ & KIỂM THỬ TOÀN LUỒNG END-TO-END
+# 6. KIỂM THỬ TOÀN BỘ LUỒNG HOẠT ĐỘNG (END-TO-END DEMO)
 # ==============================================================================
-
-def demo_small_numbers() -> None:
-    """Ví dụ số nhỏ (p = 47, q = 23, g = 4, h = 9) giúp cả nhóm kiểm tra toán học bằng tay."""
-    print("=== [A] VÍ DỤ SỐ NHỎ MINH HỌA CHO BÁO CÁO MỤC 1.3 (p=47, q=23, n=5, t=3) ===")
-    small_sys = ThresholdCryptoSystem(n=5, t=3, p=SMALL_P, q=SMALL_Q, g=SMALL_G, h=SMALL_H)
-    joint_y, shares = small_sys.generate_dkg_keys()
-    print(f"1. Pedersen DKG (5,3) sinh khóa công khai chung Y = {joint_y} (mod {SMALL_P})")
-    print(f"   Khóa bí mật thành phần các nút (mod {SMALL_Q}): {shares}")
-
-    clip_key = SymmetricCipher.generate_key()
-    kem_pkg = small_sys.kem_dem_encapsulate_key(joint_y, clip_key)
-    print(f"2. KEM-DEM đóng gói khóa K -> C1 = {kem_pkg['c1']}, C_DEM = {kem_pkg['c_dem'].hex()[:16]}...")
-
-    # Chọn 3 nút bất kỳ phê duyệt: nút 1, 3, 5
-    approvals = [small_sys.partial_decrypt(kem_pkg["c1"], nid, shares[nid]) for nid in [1, 3, 5]]
-    recovered_key = small_sys.kem_dem_decapsulate_key(kem_pkg, approvals)
-    assert recovered_key == clip_key
-    print("3. Tái tạo khóa K từ 3/5 nút phê duyệt thành công 100%!\n")
-
-
-def demo_full_production_pipeline() -> None:
-    """Kiểm thử toàn luồng Upload (TV5) -> Truy xuất (TV6) với tham số bài báo [FT]."""
-    print("=== [B] KIỂM THỬ TOÀN LUỒNG CHUẨN 2048-BIT: IDA(6,4) & DKG(5,3) ===")
-    # Giả lập dữ liệu nhị phân kết thúc bằng nhiều byte 0x00 để kiểm chứng độ an toàn của IDA
-    raw_clip = b"CAMERA_HANH_TRINH_2026_DATA_" * 1000 + b"\x00\x00\x00\x00"
-
-    # Bước 1: TV4/TV5 mã hóa clip bằng AES-256-GCM
-    k_clip = SymmetricCipher.generate_key()
-    enc_clip = SymmetricCipher.encrypt(raw_clip, k_clip)
-
-    # Bước 2: Phân mảnh ciphertext bằng Rabin IDA (6, 4) -> giãn nở đúng 1.5 lần
-    ida = RabinIDA(n=6, t=4)
-    shares = ida.distribute(enc_clip["ciphertext"])
-    ratio = (len(shares) * len(shares[0][1])) / len(enc_clip["ciphertext"])
-    print(f"1. Rabin IDA (6,4): {len(enc_clip['ciphertext'])}B -> 6 mảnh x {len(shares[0][1])}B (Hệ số giãn nở: {ratio:.2f}x)")
-
-    # Bước 3: Bọc khóa K bằng KEM-DEM với khóa chung DKG (5, 3)
-    crypto_sys = ThresholdCryptoSystem(n=5, t=3)
-    joint_y, node_shares = crypto_sys.generate_dkg_keys()
-    kem_pkg = crypto_sys.kem_dem_encapsulate_key(joint_y, k_clip)
-    print("2. Đã đóng gói khóa K bằng KEM-DEM (HKDF-SHA256 + AES-256-GCM).")
-
-    # Bước 4: TV6 truy xuất khi mất 2 mảnh IPFS (chỉ lấy mảnh 1, 2, 4, 6) & 3 nút phê duyệt (2, 4, 5)
-    approvals = [crypto_sys.partial_decrypt(kem_pkg["c1"], nid, node_shares[nid]) for nid in [2, 4, 5]]
-    recovered_k = crypto_sys.kem_dem_decapsulate_key(kem_pkg, approvals)
-
-    available_4_shares = [shares[0], shares[1], shares[3], shares[5]]
-    recovered_ct = ida.reconstruct(available_4_shares)
-    recovered_clip = SymmetricCipher.decrypt(recovered_ct, recovered_k, enc_clip["nonce"], enc_clip["tag"])
-
-    assert recovered_clip == raw_clip
-    print("3. Khôi phục toàn vẹn 100% dữ liệu gốc (bao gồm cả các byte 0x00 ở cuối)!")
-
-
 if __name__ == "__main__":
-    demo_small_numbers()
-    demo_full_production_pipeline()
+    print("=== KHỞI TẠO HỆ THỐNG FILETRUST (2048-BIT SAFE PRIME) ===")
+    pp = PublicParams.default_2048bit()
+
+    # 1. Nghi thức Pedersen DKG cho (n_SH=5, t_SH=3) theo bài báo FileTrust
+    n_sh, t_sh = 5, 3
+    shareholders, master_pk = run_dkg_ceremony(n_sh, t_sh, pp)
+    vks = {sh.index: sh.vk for sh in shareholders}
+    print(f"[1] DKG hoàn tất với ({n_sh}, {t_sh}). Master PK bit-length: {master_pk.bit_length()} bits")
+
+    # 2. Data Owner mã hóa video bằng chứng bằng AES-256-GCM và phân tán IDA (6, 4)
+    raw_video = b"EVIDENCE_VIDEO_FRAME_DATA_" * 5000  # ~130 KB dữ liệu nhị phân
+    clip_key = SymmetricCipher.generate_key()
+    ciphertext, iv_clip, tag_clip = SymmetricCipher.encrypt(raw_video, clip_key)
+
+    ida = RabinIDA(n=6, t=4)
+    pieces = ida.disperse(ciphertext)
+    # Giả lập IPFS băm nội dung từng mảnh thành CID
+    ipfs_storage = {}
+    cids = []
+    for idx, piece_bytes in pieces:
+        cid = "Qm" + hashlib.sha256(piece_bytes).hexdigest()[:44]
+        ipfs_storage[cid] = piece_bytes
+        cids.append(cid)
+    print(f"[2] Đã phân tán thành {len(pieces)} mảnh IDA lên IPFS. Mẫu CID[0]: {cids[0]}")
+
+    # 3. Bảo vệ khóa clip K bằng KEM-DEM (cách tối ưu on-chain của nhóm)
+    kem_dem = ThresholdElGamalKEMDEM(pp)
+    clip_id = "CAM04_20261125_001"
+    kem_pkg = kem_dem.encapsulate_clip_key(clip_key, master_pk, clip_id)
+
+    # Kiểm thử song song cơ chế bảo vệ từng CID theo đúng Eq. (19)-(22) của FileTrust
+    ctx_0 = f"{clip_id}:batch1:0".encode()
+    protected_cid0 = kem_dem.protect_cid_filetrust(cids[0], ctx_0, master_pk)
+    print("[3] Đã đóng gói khóa K và bảo vệ CID theo KEM-DEM thành công.")
+
+    # 4. Truy xuất bằng chứng với ngưỡng t_SH = 3 cổ đông (SH_1, SH_3, SH_5 phê duyệt)
+    approving_nodes = [shareholders[0], shareholders[2], shareholders[4]]
+    partials_clip = {sh.index: sh.partial_decrypt(kem_pkg["c1"]) for sh in approving_nodes}
+    recovered_clip_key = kem_dem.decapsulate_clip_key(kem_pkg, clip_id, partials_clip, vks)
+    assert recovered_clip_key == clip_key, "Lỗi khôi phục khóa clip!"
+
+    partials_cid = {sh.index: sh.partial_decrypt(protected_cid0["c1"]) for sh in approving_nodes}
+    recovered_cid0 = kem_dem.recover_cid_filetrust(protected_cid0, ctx_0, partials_cid, vks)
+    assert recovered_cid0 == cids[0], "Lỗi khôi phục CID theo FileTrust Eq. (19)-(22)!"
+
+    # 5. Tải 4/6 mảnh bất kỳ từ IPFS (giả lập mất mảnh 2 và 5) -> Khôi phục video gốc
+    available_pieces = [
+        (1, ipfs_storage[cids[0]]),
+        (3, ipfs_storage[cids[2]]),
+        (4, ipfs_storage[cids[3]]),
+        (6, ipfs_storage[cids[5]]),
+    ]
+    reconstructed_ct = ida.reconstruct(available_pieces)
+    recovered_video = SymmetricCipher.decrypt(reconstructed_ct, recovered_clip_key, iv_clip, tag_clip)
+    assert recovered_video == raw_video, "Video khôi phục không khớp bản gốc!"
+    print("[4] Truy xuất ngưỡng (3/5 SH) & Khôi phục IDA (4/6 mảnh) THÀNH CÔNG 100%!")
