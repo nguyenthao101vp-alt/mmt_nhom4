@@ -1,0 +1,66 @@
+{
+  "__sweep": [
+    {
+      "items": 1,
+      "publishGas": 312239,
+      "addEncCids": 117697,
+      "createBatch": 194542,
+      "reencGas": 693906,
+      "submitReenc": 226445
+    },
+    {
+      "items": 3,
+      "publishGas": 449731,
+      "addEncCids": 255189,
+      "createBatch": 194542,
+      "reencGas": 831830,
+      "submitReenc": 364369
+    },
+    {
+      "items": 6,
+      "publishGas": 655927,
+      "addEncCids": 461385,
+      "createBatch": 194542,
+      "reencGas": 1038704,
+      "submitReenc": 571243
+    },
+    {
+      "items": 7,
+      "publishGas": 724679,
+      "addEncCids": 530137,
+      "createBatch": 194542,
+      "reencGas": 1107642,
+      "submitReenc": 640181
+    },
+    {
+      "items": 12,
+      "publishGas": 1068391,
+      "addEncCids": 873849,
+      "createBatch": 194542,
+      "reencGas": 1452428,
+      "submitReenc": 984967
+    },
+    {
+      "items": 24,
+      "publishGas": 1893103,
+      "addEncCids": 1698561,
+      "createBatch": 194542,
+      "reencGas": 2279924,
+      "submitReenc": 1812463
+    },
+    {
+      "items": 48,
+      "publishGas": 3542779,
+      "addEncCids": 3348237,
+      "createBatch": 194542,
+      "reencGas": 3934868,
+      "submitReenc": 3467407
+    }
+  ],
+  "deploy": {
+    "deploy:AccessControl": 905448,
+    "deploy:DKG": 642893,
+    "deploy:DataVault": 1233227,
+    "deploy:TElG": 409786
+  }
+}
