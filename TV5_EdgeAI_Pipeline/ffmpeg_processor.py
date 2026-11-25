@@ -8,8 +8,6 @@ Mục tiêu cấu hình theo kế hoạch nhóm:
 - Bitrate video: 4 Mbps
 - Không mã hóa âm thanh để giữ cấu hình dung lượng video gần mức 7,5 MB
   (dung lượng thực tế còn phụ thuộc container và nội dung video).
-
-Lưu ý: Đây là module độc lập. Chưa tích hợp với module mã hóa TV4/IPFS/Smart Contract.
 """
 
 from __future__ import annotations
@@ -111,8 +109,8 @@ def cut_and_compress_clip(
     command = [
         ffmpeg,
         "-y",
-        "-i", str(source),
         "-ss", f"{start_time:.3f}",
+        "-i", str(source),
         "-t", f"{actual_duration:.3f}",
         "-map", "0:v:0",
         "-an",

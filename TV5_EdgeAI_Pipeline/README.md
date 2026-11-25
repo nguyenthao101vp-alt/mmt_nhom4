@@ -5,7 +5,7 @@ Module phat hien khuon mat (YuNet), tao vector dac trung (SFace), doi chieu whit
 ## 1. Cau truc thu muc
 
 ```text
-TV5_AI_Module/
+TV5_EdgeAI_Pipeline/
 ├── models/                  # ONNX models (khong commit len Git)
 ├── whitelist/               # known_faces.json (khong commit len Git)
 ├── data/                    # anh dang ky va video test
@@ -17,3 +17,18 @@ TV5_AI_Module/
 ├── analyze_video.py         # Luong chinh: phan tich video + cat clip + xuat JSON
 ├── download_models.py       # Tai model tu OpenCV Zoo
 └── requirements.txt
+```
+
+## Chay pipeline
+
+Tu thu muc goc repo, chay voi video mac dinh `TV5_EdgeAI_Pipeline/data/clip_tv2.mp4`:
+
+```powershell
+python TV5_EdgeAI_Pipeline/main.py
+```
+
+Truyen video khac bang `--video`; duong dan co khoang trang can dat trong dau ngoac kep:
+
+```powershell
+python TV5_EdgeAI_Pipeline/main.py --video "C:\duong dan\video.mp4"
+```
